@@ -34,11 +34,48 @@ def angle_wrap(a):
 
 def compute_delta(poses):
     """(T,6) absolute -> (T,6) delta; last frame repeats second-to-last."""
+    if len(poses) == 0:
+        return np.zeros_like(poses)
+    if len(poses) == 1:
+        return np.zeros_like(poses)
     delta = np.zeros_like(poses)
     delta[:-1] = poses[1:] - poses[:-1]
     delta[:-1, 3:6] = angle_wrap(delta[:-1, 3:6])
     delta[-1] = delta[-2]
     return delta
+
+
+def map_finger_distance_to_gripper(finger_dist, close_threshold=0.03, open_threshold=0.08):
+    """Map thumb-index distance in meters to an ALOHA-like [0, 1] gripper signal."""
+    if finger_dist <= close_threshold:
+        return np.float32(0.0)
+    if finger_dist >= open_threshold:
+        return np.float32(1.0)
+    value = (finger_dist - close_threshold) / (open_threshold - close_threshold)
+    return np.float32(np.clip(value, 0.0, 1.0))
+
+
+def build_human_actions(left_poses, right_poses, left_gripper, right_gripper):
+    """Construct 14-D actions to match the guide: pose delta + next-frame gripper."""
+    left_delta = compute_delta(left_poses)
+    right_delta = compute_delta(right_poses)
+    left_gripper_cmd = np.array(
+        [map_finger_distance_to_gripper(v) for v in left_gripper],
+        dtype=np.float32,
+    )
+    right_gripper_cmd = np.array(
+        [map_finger_distance_to_gripper(v) for v in right_gripper],
+        dtype=np.float32,
+    )
+    return np.concatenate(
+        [
+            left_delta,
+            left_gripper_cmd[:, None],
+            right_delta,
+            right_gripper_cmd[:, None],
+        ],
+        axis=1,
+    )
 
 
 def encode_video(img_dir, out_path, fps):
@@ -93,24 +130,50 @@ def main():
     d = np.load(args.poses)
     left_poses  = d["left_wrist_poses"].astype(np.float32)   # (T,6)
     right_poses = d["right_wrist_poses"].astype(np.float32)  # (T,6)
+    if "left_gripper" not in d or "right_gripper" not in d:
+        raise ValueError(
+            "Pose file is missing left_gripper/right_gripper. "
+            "Please re-run extract_wrist_pose.py with the updated script."
+        )
+    left_gripper = d["left_gripper"].astype(np.float32)
+    right_gripper = d["right_gripper"].astype(np.float32)
     T = len(left_poses)
     print(f"Loaded {T} frames of wrist poses")
 
-    # state: [left(6), right(6)] = 12-D
-    states  = np.concatenate([left_poses, right_poses], axis=1)  # (T,12)
+    left_gripper_state = np.array(
+        [map_finger_distance_to_gripper(v) for v in left_gripper],
+        dtype=np.float32,
+    )
+    right_gripper_state = np.array(
+        [map_finger_distance_to_gripper(v) for v in right_gripper],
+        dtype=np.float32,
+    )
 
-    # action: delta state (wrist velocity in camera frame)
-    left_delta  = compute_delta(left_poses)
-    right_delta = compute_delta(right_poses)
-    actions = np.concatenate([left_delta, right_delta], axis=1)  # (T,12)
+    # state: [left pose(6), left gripper(1), right pose(6), right gripper(1)] = 14-D
+    states = np.concatenate(
+        [
+            left_poses,
+            left_gripper_state[:, None],
+            right_poses,
+            right_gripper_state[:, None],
+        ],
+        axis=1,
+    )
+
+    # action: delta pose on smoothed wrist trajectories + next-frame gripper command
+    actions = build_human_actions(left_poses, right_poses, left_gripper, right_gripper)
 
     state_names = (
         [f"left_wrist_{k}"  for k in ["x","y","z","rx","ry","rz"]] +
-        [f"right_wrist_{k}" for k in ["x","y","z","rx","ry","rz"]]
+        ["left_gripper"] +
+        [f"right_wrist_{k}" for k in ["x","y","z","rx","ry","rz"]] +
+        ["right_gripper"]
     )
     action_names = (
         [f"left_delta_{k}"  for k in ["x","y","z","rx","ry","rz"]] +
-        [f"right_delta_{k}" for k in ["x","y","z","rx","ry","rz"]]
+        ["left_gripper"] +
+        [f"right_delta_{k}" for k in ["x","y","z","rx","ry","rz"]] +
+        ["right_gripper"]
     )
 
     # ── camera info ───────────────────────────────────────────────────────────
@@ -214,10 +277,10 @@ def main():
             "video_info": video_info,
         }
     features["observation.state"] = {
-        "dtype": "float32", "shape": [12], "names": state_names,
+        "dtype": "float32", "shape": [14], "names": state_names,
     }
     features["action"] = {
-        "dtype": "float32", "shape": [12], "names": action_names,
+        "dtype": "float32", "shape": [14], "names": action_names,
     }
     for col, dtype in [
         ("episode_index","int64"), ("frame_index","int64"),

@@ -48,21 +48,29 @@ def get_depth_at(depth_img, u, v, H, W, search_r=4):
                     return d
     return 0
 
+def landmark_to_3d(lms, idx, depth_img, intr, H, W, fallback_depth=0):
+    """Lift a landmark to 3D, falling back to wrist depth if local depth is missing."""
+    lm = lms[idx]
+    u = int(np.clip(lm.x * W, 0, W-1))
+    v = int(np.clip(lm.y * H, 0, H-1))
+    d = get_depth_at(depth_img, u, v, H, W)
+    if d == 0:
+        d = fallback_depth
+    if d == 0:
+        return None
+    return px_to_3d(u, v, d, intr)
+
 def compute_orientation(lms, depth_img, intr, H, W):
     """Wrist orientation from palm plane (lm 0, 5, 17)."""
-    def lm3d(idx):
-        lm = lms[idx]
-        u = int(np.clip(lm.x * W, 0, W-1))
-        v = int(np.clip(lm.y * H, 0, H-1))
-        d = get_depth_at(depth_img, u, v, H, W)
-        if d == 0:
-            lm0 = lms[0]
-            u0 = int(np.clip(lm0.x * W, 0, W-1))
-            v0 = int(np.clip(lm0.y * H, 0, H-1))
-            d = get_depth_at(depth_img, u0, v0, H, W)
-        return px_to_3d(u, v, d, intr)
-
-    p0, p5, p17 = lm3d(0), lm3d(5), lm3d(17)
+    lm0 = lms[0]
+    u0 = int(np.clip(lm0.x * W, 0, W-1))
+    v0 = int(np.clip(lm0.y * H, 0, H-1))
+    wrist_depth = get_depth_at(depth_img, u0, v0, H, W)
+    p0 = landmark_to_3d(lms, 0, depth_img, intr, H, W, wrist_depth)
+    p5 = landmark_to_3d(lms, 5, depth_img, intr, H, W, wrist_depth)
+    p17 = landmark_to_3d(lms, 17, depth_img, intr, H, W, wrist_depth)
+    if p0 is None or p5 is None or p17 is None:
+        return np.eye(3)
     v1 = p5 - p0
     v2 = p17 - p0
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
@@ -76,6 +84,14 @@ def compute_orientation(lms, depth_img, intr, H, W):
     normal /= nn
     v2c = np.cross(normal, v1)
     return np.stack([v2c, v1, normal], axis=1)
+
+def compute_gripper_distance(lms, depth_img, intr, H, W, wrist_depth):
+    """Use thumb/index fingertip distance as a proxy for gripper opening."""
+    p4 = landmark_to_3d(lms, 4, depth_img, intr, H, W, wrist_depth)
+    p8 = landmark_to_3d(lms, 8, depth_img, intr, H, W, wrist_depth)
+    if p4 is None or p8 is None:
+        return np.float32(0.0)
+    return np.float32(np.linalg.norm(p4 - p8))
 
 def interpolate_invalid(poses, valid):
     result = poses.copy()
@@ -136,6 +152,8 @@ def main():
 
     left_poses  = np.zeros((T, 6), dtype=np.float32)
     right_poses = np.zeros((T, 6), dtype=np.float32)
+    left_gripper  = np.zeros(T, dtype=np.float32)
+    right_gripper = np.zeros(T, dtype=np.float32)
     left_valid  = np.zeros(T, dtype=bool)
     right_valid = np.zeros(T, dtype=bool)
 
@@ -170,12 +188,15 @@ def main():
             rot_mat   = compute_orientation(lms, depth_img, depth_intr, H, W)
             euler     = R.from_matrix(rot_mat).as_euler("xyz")
             pose      = np.concatenate([wrist_pos, euler])
+            gripper   = compute_gripper_distance(lms, depth_img, depth_intr, H, W, d)
 
             if side == "left":
                 left_poses[i]  = pose
+                left_gripper[i] = gripper
                 left_valid[i]  = True
             else:
                 right_poses[i] = pose
+                right_gripper[i] = gripper
                 right_valid[i] = True
 
     print(f"Detection: left={left_valid.sum()}/{T} ({100*left_valid.mean():.1f}%)  right={right_valid.sum()}/{T} ({100*right_valid.mean():.1f}%)")
@@ -190,6 +211,8 @@ def main():
     np.savez(str(out),
              left_wrist_poses=left_poses,
              right_wrist_poses=right_poses,
+             left_gripper=left_gripper,
+             right_gripper=right_gripper,
              left_valid=left_valid,
              right_valid=right_valid,
              fps=np.float32(30.0))
