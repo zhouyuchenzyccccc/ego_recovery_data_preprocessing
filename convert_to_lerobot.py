@@ -21,6 +21,32 @@ CAMERAS = {
     "observation.images.right_hand": ("08", "RGB"),
 }
 
+def get_by_alias(mapping, aliases):
+    if not isinstance(mapping, dict):
+        return None
+    normalized = {str(k).lower(): v for k, v in mapping.items()}
+    for alias in aliases:
+        if alias.lower() in normalized:
+            return normalized[alias.lower()]
+    return None
+
+def normalize_intrinsic(node):
+    if node is None:
+        return None
+    if not isinstance(node, dict):
+        return None
+    intrinsic = get_by_alias(node, ["intrinsic", "intrinsics"])
+    if intrinsic is None:
+        intrinsic = node
+    if not isinstance(intrinsic, dict):
+        return None
+    result = {}
+    for key in ["fx", "fy", "cx", "cy", "width", "height"]:
+        value = get_by_alias(intrinsic, [key])
+        if value is not None:
+            result[key] = value
+    return result if all(k in result for k in ["fx", "fy", "cx", "cy"]) else None
+
 
 def sort_key(path):
     return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
@@ -165,8 +191,24 @@ def load_sequence_data(data_dir, pose_path):
 
     with open(data_dir / "camera_params.json", encoding="utf-8") as f:
         cam_params = json.load(f)
-    H = int(cam_params["07"]["RGB"]["intrinsic"]["height"])
-    W = int(cam_params["07"]["RGB"]["intrinsic"]["width"])
+    cam = get_by_alias(cam_params, ["07", "7"])
+    rgb_intr = (
+        normalize_intrinsic(get_by_alias(cam, ["RGB", "rgb", "color", "Color"]))
+        or normalize_intrinsic(get_by_alias(cam, ["rgb_intrinsic", "color_intrinsic"]))
+        or normalize_intrinsic(cam)
+    )
+    if rgb_intr is not None and "height" in rgb_intr and "width" in rgb_intr:
+        H = int(rgb_intr["height"])
+        W = int(rgb_intr["width"])
+    else:
+        sample_rgb = next((data_dir / "07" / "RGB").glob("*.jpg"), None)
+        if sample_rgb is None:
+            raise FileNotFoundError(f"No RGB frames found in {data_dir / '07' / 'RGB'}")
+        import cv2
+        image = cv2.imread(str(sample_rgb))
+        if image is None:
+            raise FileNotFoundError(f"Failed to read sample RGB frame: {sample_rgb}")
+        H, W = image.shape[:2]
     return left_poses, right_poses, left_gripper, right_gripper, H, W
 
 

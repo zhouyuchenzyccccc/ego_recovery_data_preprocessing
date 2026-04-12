@@ -23,13 +23,55 @@ DEPTH_SCALE = 0.001  # Orbbec: uint16 mm -> meters
 def sort_key(path):
     return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
 
+def get_by_alias(mapping, aliases):
+    if not isinstance(mapping, dict):
+        return None
+    normalized = {str(k).lower(): v for k, v in mapping.items()}
+    for alias in aliases:
+        if alias.lower() in normalized:
+            return normalized[alias.lower()]
+    return None
+
+def normalize_intrinsic(node):
+    if node is None:
+        return None
+    if not isinstance(node, dict):
+        return None
+    intrinsic = get_by_alias(node, ["intrinsic", "intrinsics"])
+    if intrinsic is None:
+        intrinsic = node
+    if not isinstance(intrinsic, dict):
+        return None
+    result = {}
+    for key in ["fx", "fy", "cx", "cy", "width", "height"]:
+        value = get_by_alias(intrinsic, [key])
+        if value is not None:
+            result[key] = value
+    return result if all(k in result for k in ["fx", "fy", "cx", "cy"]) else None
+
 def load_cam_params(data_dir, cam_id):
     with open(Path(data_dir) / "camera_params.json") as f:
         p = json.load(f)
-    cam = p[cam_id]
+    cam = get_by_alias(p, [cam_id, str(int(cam_id)) if str(cam_id).isdigit() else cam_id])
+    if cam is None:
+        raise KeyError(f"Camera {cam_id} not found in camera_params.json")
+    rgb_intr = (
+        normalize_intrinsic(get_by_alias(cam, ["RGB", "rgb", "color", "Color"]))
+        or normalize_intrinsic(get_by_alias(cam, ["rgb_intrinsic", "color_intrinsic"]))
+        or normalize_intrinsic(cam)
+    )
+    depth_intr = (
+        normalize_intrinsic(get_by_alias(cam, ["Depth", "depth"]))
+        or normalize_intrinsic(get_by_alias(cam, ["depth_intrinsic"]))
+        or rgb_intr
+    )
+    if rgb_intr is None or depth_intr is None:
+        raise KeyError(
+            f"Could not parse RGB/Depth intrinsics for camera {cam_id} from camera_params.json"
+        )
     return {
-        "rgb": cam["RGB"]["intrinsic"],
-        "depth": cam["Depth"]["intrinsic"],
+        "rgb": rgb_intr,
+        "depth": depth_intr,
     }
 
 def px_to_3d(u, v, d_raw, intr):
@@ -155,13 +197,20 @@ def process_sequence(seq_dir, output_path, detector, cam_id, smooth_method):
     params = load_cam_params(seq_dir, cam_id)
     rgb_intr = params["rgb"]
     depth_intr = params["depth"]
-    H, W = int(rgb_intr["height"]), int(rgb_intr["width"])
 
     rgb_files = sorted((seq_dir / cam_id / "RGB").glob("*.jpg"))
     depth_dir = seq_dir / cam_id / "Depth"
     T = len(rgb_files)
     if T == 0:
         raise FileNotFoundError(f"No RGB frames found in {seq_dir / cam_id / 'RGB'}")
+    sample_img = cv2.imread(str(rgb_files[0]))
+    if sample_img is None:
+        raise FileNotFoundError(f"Failed to read sample RGB frame: {rgb_files[0]}")
+    H, W = sample_img.shape[:2]
+    rgb_intr.setdefault("height", H)
+    rgb_intr.setdefault("width", W)
+    depth_intr.setdefault("height", H)
+    depth_intr.setdefault("width", W)
     print(f"Processing sequence {seq_dir.name}: {T} frames from camera {cam_id}")
 
     left_poses  = np.zeros((T, 6), dtype=np.float32)
