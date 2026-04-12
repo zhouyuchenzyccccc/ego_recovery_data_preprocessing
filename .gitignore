@@ -1,0 +1,13 @@
+lerobot_dataset/videos/chunk-000/observation.images.ego/episode_000000.mp4
+wrist_poses.npz
+wrist_viz.mp4
+__pycache__/convert_to_lerobot.cpython-310.pyc
+__pycache__/extract_wrist_pose.cpython-310.pyc
+__pycache__/visualize_wrist_pose.cpython-310.pyc
+lerobot_dataset/data/chunk-000/episode_000000.parquet
+lerobot_dataset/meta/episodes.jsonl
+lerobot_dataset/meta/info.json
+lerobot_dataset/meta/stats.json
+lerobot_dataset/meta/tasks.jsonl
+lerobot_dataset/videos/chunk-000/observation.images.left_hand/episode_000000.mp4
+lerobot_dataset/videos/chunk-000/observation.images.right_hand/episode_000000.mp4
