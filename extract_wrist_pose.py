@@ -3,8 +3,9 @@
 Extract 3D wrist poses from ego camera (07) using MediaPipe + depth.
 Camera frame is used directly (no coordinate transform needed).
 
-Usage:
-    python3 extract_wrist_pose.py --data_dir /home/ubuntu/orbbec/src/sync/test/test/ego4
+Supports either:
+1. A single sequence directory containing camera_params.json and 07/RGB, or
+2. A parent directory whose immediate children are multiple sequence directories.
 """
 import argparse, json
 import numpy as np
@@ -18,6 +19,9 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 DEPTH_SCALE = 0.001  # Orbbec: uint16 mm -> meters
+
+def sort_key(path):
+    return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
 
 def load_cam_params(data_dir, cam_id):
     with open(Path(data_dir) / "camera_params.json") as f:
@@ -120,35 +124,45 @@ def smooth(poses, method):
             s[:, d] = savgol_filter(s[:, d], win, 3)
     return s
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="/home/ubuntu/orbbec/src/sync/test/test/ego2")
-    ap.add_argument("--output", default="/home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/wrist_poses.npz")
-    ap.add_argument("--model_path", default="/home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task")
-    ap.add_argument("--cam_id", default="07")
-    ap.add_argument("--smooth_method", default="median_then_savgol",
-                    choices=["savgol","ema","median_then_savgol","none"])
-    args = ap.parse_args()
+def is_sequence_dir(path, cam_id):
+    return (path / "camera_params.json").is_file() and (path / cam_id / "RGB").is_dir()
 
-    data_dir = Path(args.data_dir)
-    params = load_cam_params(data_dir, args.cam_id)
+def discover_sequence_dirs(root_dir, cam_id):
+    root_dir = Path(root_dir)
+    if is_sequence_dir(root_dir, cam_id):
+        return [root_dir]
+    seq_dirs = sorted(
+        [path for path in root_dir.iterdir() if path.is_dir() and is_sequence_dir(path, cam_id)],
+        key=sort_key,
+    )
+    if not seq_dirs:
+        raise FileNotFoundError(
+            f"No sequence directories found under {root_dir}. "
+            f"Expected either {root_dir / cam_id / 'RGB'} or child folders like */{cam_id}/RGB."
+        )
+    return seq_dirs
+
+def resolve_output_path(output_arg, seq_dir, batch_mode):
+    if not output_arg:
+        return seq_dir / "wrist_poses.npz"
+    output_path = Path(output_arg)
+    if not batch_mode and output_path.suffix == ".npz":
+        return output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path / f"{seq_dir.name}_wrist_poses.npz"
+
+def process_sequence(seq_dir, output_path, detector, cam_id, smooth_method):
+    params = load_cam_params(seq_dir, cam_id)
     rgb_intr = params["rgb"]
     depth_intr = params["depth"]
     H, W = int(rgb_intr["height"]), int(rgb_intr["width"])
 
-    rgb_files = sorted((data_dir / args.cam_id / "RGB").glob("*.jpg"))
-    depth_dir = data_dir / args.cam_id / "Depth"
+    rgb_files = sorted((seq_dir / cam_id / "RGB").glob("*.jpg"))
+    depth_dir = seq_dir / cam_id / "Depth"
     T = len(rgb_files)
-    print(f"Processing {T} frames from camera {args.cam_id}")
-
-    base_opts = mp_python.BaseOptions(model_asset_path=args.model_path)
-    opts = mp_vision.HandLandmarkerOptions(
-        base_options=base_opts, num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    detector = mp_vision.HandLandmarker.create_from_options(opts)
+    if T == 0:
+        raise FileNotFoundError(f"No RGB frames found in {seq_dir / cam_id / 'RGB'}")
+    print(f"Processing sequence {seq_dir.name}: {T} frames from camera {cam_id}")
 
     left_poses  = np.zeros((T, 6), dtype=np.float32)
     right_poses = np.zeros((T, 6), dtype=np.float32)
@@ -173,7 +187,6 @@ def main():
         result = detector.detect(mp_img)
 
         for lms, handedness in zip(result.hand_landmarks, result.handedness):
-            # MediaPipe assumes selfie/front-facing -> flip for fixed ego cam
             side = handedness[0].category_name.lower()
             side = "right" if side == "left" else "left"
 
@@ -203,12 +216,11 @@ def main():
 
     left_poses  = interpolate_invalid(left_poses,  left_valid)
     right_poses = interpolate_invalid(right_poses, right_valid)
-    left_poses  = smooth(left_poses,  args.smooth_method)
-    right_poses = smooth(right_poses, args.smooth_method)
+    left_poses  = smooth(left_poses,  smooth_method)
+    right_poses = smooth(right_poses, smooth_method)
 
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(str(out),
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(output_path),
              left_wrist_poses=left_poses,
              right_wrist_poses=right_poses,
              left_gripper=left_gripper,
@@ -216,7 +228,38 @@ def main():
              left_valid=left_valid,
              right_valid=right_valid,
              fps=np.float32(30.0))
-    print(f"Saved -> {out}")
+    print(f"Saved -> {output_path}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", required=True,
+                    help="Single sequence dir or a parent dir containing multiple sequence subdirectories")
+    ap.add_argument("--output", default=None,
+                    help="For single sequence: output .npz path. For batch mode: output directory. "
+                         "If omitted, saves wrist_poses.npz inside each sequence directory.")
+    ap.add_argument("--model_path", default="/home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task")
+    ap.add_argument("--cam_id", default="07")
+    ap.add_argument("--smooth_method", default="median_then_savgol",
+                    choices=["savgol","ema","median_then_savgol","none"])
+    args = ap.parse_args()
+
+    data_dir = Path(args.data_dir)
+    seq_dirs = discover_sequence_dirs(data_dir, args.cam_id)
+    batch_mode = len(seq_dirs) > 1
+
+    base_opts = mp_python.BaseOptions(model_asset_path=args.model_path)
+    opts = mp_vision.HandLandmarkerOptions(
+        base_options=base_opts, num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    detector = mp_vision.HandLandmarker.create_from_options(opts)
+
+    print(f"Discovered {len(seq_dirs)} sequence(s) under {data_dir}")
+    for seq_dir in seq_dirs:
+        out = resolve_output_path(args.output, seq_dir, batch_mode)
+        process_sequence(seq_dir, out, detector, args.cam_id, args.smooth_method)
 
 if __name__ == "__main__":
     main()

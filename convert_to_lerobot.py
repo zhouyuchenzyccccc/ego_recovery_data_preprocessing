@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-Convert ego2 data + extracted wrist poses to LeRobot v2 dataset format.
+Convert ego data + extracted wrist poses to LeRobot v2 dataset format.
 
-Directory layout produced:
-  <output>/
-    meta/info.json
-    meta/episodes.jsonl
-    meta/tasks.jsonl
-    meta/stats.json
-    data/chunk-000/episode_000000.parquet
-    videos/chunk-000/observation.images.ego/episode_000000.mp4
-    videos/chunk-000/observation.images.left_hand/episode_000000.mp4
-    videos/chunk-000/observation.images.right_hand/episode_000000.mp4
-
-Usage:
-    python3 convert_to_lerobot.py \
-        --data_dir /home/ubuntu/orbbec/src/sync/test/test/ego2 \
-        --poses    /home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/wrist_poses.npz \
-        --output   /home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/lerobot_dataset \
-        --task     "human ego recovery demonstration"
+Supports either:
+1. A single sequence directory with one pose file, or
+2. A parent directory whose immediate children are multiple sequence directories.
 """
-import argparse, json, subprocess
-import numpy as np
+import argparse
+import json
+import subprocess
 from pathlib import Path
-import pandas as pd
+
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+CAMERAS = {
+    "observation.images.ego":        ("07", "RGB"),
+    "observation.images.left_hand":  ("06", "RGB"),
+    "observation.images.right_hand": ("08", "RGB"),
+}
+
+
+def sort_key(path):
+    return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
 
 
 def angle_wrap(a):
@@ -101,45 +99,78 @@ def compute_stats(arr):
     """arr: (T, D) float32 -> dict with mean/std/min/max per dim."""
     return {
         "mean": arr.mean(axis=0).tolist(),
-        "std":  arr.std(axis=0).clip(1e-6).tolist(),
-        "min":  arr.min(axis=0).tolist(),
-        "max":  arr.max(axis=0).tolist(),
+        "std": arr.std(axis=0).clip(1e-6).tolist(),
+        "min": arr.min(axis=0).tolist(),
+        "max": arr.max(axis=0).tolist(),
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="/home/ubuntu/orbbec/src/sync/test/test/ego2")
-    ap.add_argument("--poses",    default="/home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/wrist_poses.npz")
-    ap.add_argument("--output",   default="/home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/lerobot_dataset")
-    ap.add_argument("--task",     default="human ego recovery demonstration")
-    ap.add_argument("--fps",      type=float, default=30.0)
-    ap.add_argument("--episode_index", type=int, default=0,
-                    help="Episode index (increment when adding more episodes)")
-    ap.add_argument("--no_video", action="store_true",
-                    help="Skip video encoding (for quick testing)")
-    args = ap.parse_args()
+def is_sequence_dir(path, cam_id):
+    return (path / "camera_params.json").is_file() and (path / cam_id / "RGB").is_dir()
 
-    data_dir = Path(args.data_dir)
-    out_dir  = Path(args.output)
-    fps      = args.fps
-    ep_idx   = args.episode_index
-    chunk    = ep_idx // 1000
 
-    # ── load poses ────────────────────────────────────────────────────────────
-    d = np.load(args.poses)
-    left_poses  = d["left_wrist_poses"].astype(np.float32)   # (T,6)
-    right_poses = d["right_wrist_poses"].astype(np.float32)  # (T,6)
-    if "left_gripper" not in d or "right_gripper" not in d:
+def discover_sequence_dirs(root_dir, cam_id):
+    root_dir = Path(root_dir)
+    if is_sequence_dir(root_dir, cam_id):
+        return [root_dir]
+    seq_dirs = sorted(
+        [path for path in root_dir.iterdir() if path.is_dir() and is_sequence_dir(path, cam_id)],
+        key=sort_key,
+    )
+    if not seq_dirs:
+        raise FileNotFoundError(
+            f"No sequence directories found under {root_dir}. "
+            f"Expected either {root_dir / cam_id / 'RGB'} or child folders like */{cam_id}/RGB."
+        )
+    return seq_dirs
+
+
+def resolve_pose_path(poses_arg, seq_dir, batch_mode):
+    if poses_arg is None:
+        pose_path = seq_dir / "wrist_poses.npz"
+        if not pose_path.exists():
+            raise FileNotFoundError(f"Missing pose file: {pose_path}")
+        return pose_path
+
+    poses_path = Path(poses_arg)
+    if not batch_mode and poses_path.suffix == ".npz":
+        return poses_path
+
+    candidates = [
+        poses_path / f"{seq_dir.name}_wrist_poses.npz",
+        poses_path / seq_dir.name / "wrist_poses.npz",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find pose file for sequence {seq_dir.name} under {poses_path}. "
+        f"Tried: {', '.join(str(path) for path in candidates)}"
+    )
+
+
+def load_sequence_data(data_dir, pose_path):
+    pose_data = np.load(pose_path)
+    left_poses = pose_data["left_wrist_poses"].astype(np.float32)
+    right_poses = pose_data["right_wrist_poses"].astype(np.float32)
+    if "left_gripper" not in pose_data or "right_gripper" not in pose_data:
         raise ValueError(
-            "Pose file is missing left_gripper/right_gripper. "
+            f"Pose file is missing left_gripper/right_gripper: {pose_path}. "
             "Please re-run extract_wrist_pose.py with the updated script."
         )
-    left_gripper = d["left_gripper"].astype(np.float32)
-    right_gripper = d["right_gripper"].astype(np.float32)
-    T = len(left_poses)
-    print(f"Loaded {T} frames of wrist poses")
+    left_gripper = pose_data["left_gripper"].astype(np.float32)
+    right_gripper = pose_data["right_gripper"].astype(np.float32)
+    if not (len(left_poses) == len(right_poses) == len(left_gripper) == len(right_gripper)):
+        raise ValueError(f"Pose length mismatch in {pose_path}")
 
+    with open(data_dir / "camera_params.json", encoding="utf-8") as f:
+        cam_params = json.load(f)
+    H = int(cam_params["07"]["RGB"]["intrinsic"]["height"])
+    W = int(cam_params["07"]["RGB"]["intrinsic"]["width"])
+    return left_poses, right_poses, left_gripper, right_gripper, H, W
+
+
+def build_state_action_arrays(left_poses, right_poses, left_gripper, right_gripper):
     left_gripper_state = np.array(
         [map_finger_distance_to_gripper(v) for v in left_gripper],
         dtype=np.float32,
@@ -148,8 +179,6 @@ def main():
         [map_finger_distance_to_gripper(v) for v in right_gripper],
         dtype=np.float32,
     )
-
-    # state: [left pose(6), left gripper(1), right pose(6), right gripper(1)] = 14-D
     states = np.concatenate(
         [
             left_poses,
@@ -159,192 +188,247 @@ def main():
         ],
         axis=1,
     )
-
-    # action: delta pose on smoothed wrist trajectories + next-frame gripper command
     actions = build_human_actions(left_poses, right_poses, left_gripper, right_gripper)
+    return states, actions
 
+
+def get_feature_names():
     state_names = (
-        [f"left_wrist_{k}"  for k in ["x","y","z","rx","ry","rz"]] +
-        ["left_gripper"] +
-        [f"right_wrist_{k}" for k in ["x","y","z","rx","ry","rz"]] +
-        ["right_gripper"]
+        [f"left_wrist_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
+        + ["left_gripper"]
+        + [f"right_wrist_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
+        + ["right_gripper"]
     )
     action_names = (
-        [f"left_delta_{k}"  for k in ["x","y","z","rx","ry","rz"]] +
-        ["left_gripper"] +
-        [f"right_delta_{k}" for k in ["x","y","z","rx","ry","rz"]] +
-        ["right_gripper"]
+        [f"left_delta_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
+        + ["left_gripper"]
+        + [f"right_delta_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
+        + ["right_gripper"]
     )
+    return state_names, action_names
 
-    # ── camera info ───────────────────────────────────────────────────────────
-    with open(data_dir / "camera_params.json") as f:
-        cam_params = json.load(f)
-    H = int(cam_params["07"]["RGB"]["intrinsic"]["height"])
-    W = int(cam_params["07"]["RGB"]["intrinsic"]["width"])
 
-    # camera_key -> (folder_id, image_subdir)
-    cameras = {
-        "observation.images.ego":        ("07", "RGB"),
-        "observation.images.left_hand":  ("06", "RGB"),
-        "observation.images.right_hand": ("08", "RGB"),
+def build_features(H, W, fps):
+    state_names, action_names = get_feature_names()
+    video_info = {
+        "video.fps": fps,
+        "video.codec": "h264",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": False,
+        "has_audio": False,
     }
+    features = {}
+    for video_key in CAMERAS:
+        features[video_key] = {
+            "dtype": "video",
+            "shape": [H, W, 3],
+            "names": ["height", "width", "channel"],
+            "video_info": video_info,
+        }
+    features["observation.state"] = {
+        "dtype": "float32",
+        "shape": [14],
+        "names": state_names,
+    }
+    features["action"] = {
+        "dtype": "float32",
+        "shape": [14],
+        "names": action_names,
+    }
+    for col, dtype in [
+        ("episode_index", "int64"),
+        ("frame_index", "int64"),
+        ("timestamp", "float32"),
+        ("next.done", "bool"),
+        ("index", "int64"),
+        ("task_index", "int64"),
+    ]:
+        features[col] = {"dtype": dtype, "shape": [1], "names": None}
+    return features
 
-    ep_str    = f"episode_{ep_idx:06d}"
+
+def write_episode(data_dir, out_dir, fps, ep_idx, task, no_video, global_offset, states, actions):
+    T = len(states)
+    chunk = ep_idx // 1000
+    ep_str = f"episode_{ep_idx:06d}"
     chunk_str = f"chunk-{chunk:03d}"
 
-    # ── encode videos ─────────────────────────────────────────────────────────
-    if not args.no_video:
-        for video_key, (cam_id, modality) in cameras.items():
-            img_dir  = data_dir / cam_id / modality
+    if not no_video:
+        for video_key, (cam_id, modality) in CAMERAS.items():
+            img_dir = data_dir / cam_id / modality
             vid_path = out_dir / "videos" / chunk_str / video_key / f"{ep_str}.mp4"
-            print(f"Encoding {video_key} ...")
+            print(f"Encoding {video_key} for {data_dir.name} ...")
             encode_video(img_dir, vid_path, fps)
             print(f"  -> {vid_path}")
     else:
-        print("Skipping video encoding (--no_video)")
+        print(f"Skipping video encoding for {data_dir.name} (--no_video)")
 
-    # ── build parquet ─────────────────────────────────────────────────────────
     video_type = pa.struct([
-        pa.field("path",      pa.string()),
+        pa.field("path", pa.string()),
         pa.field("timestamp", pa.float32()),
     ])
 
-    global_offset = ep_idx * T
+    columns = {
+        "episode_index": pa.array([ep_idx] * T, type=pa.int64()),
+        "frame_index": pa.array(list(range(T)), type=pa.int64()),
+        "timestamp": pa.array([np.float32(t / fps) for t in range(T)], type=pa.float32()),
+        "next.done": pa.array([False] * (T - 1) + [True], type=pa.bool_()),
+        "index": pa.array(list(range(global_offset, global_offset + T)), type=pa.int64()),
+        "task_index": pa.array([0] * T, type=pa.int64()),
+        "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32())),
+        "action": pa.array(actions.tolist(), type=pa.list_(pa.float32())),
+    }
 
-    # Build column arrays
-    col_ep_idx    = pa.array([ep_idx] * T,                    type=pa.int64())
-    col_fr_idx    = pa.array(list(range(T)),                  type=pa.int64())
-    col_ts        = pa.array([np.float32(t/fps) for t in range(T)], type=pa.float32())
-    col_done      = pa.array([False]*(T-1) + [True],          type=pa.bool_())
-    col_index     = pa.array(list(range(global_offset, global_offset+T)), type=pa.int64())
-    col_task_idx  = pa.array([0] * T,                         type=pa.int64())
-    col_state     = pa.array(states.tolist(),                 type=pa.list_(pa.float32()))
-    col_action    = pa.array(actions.tolist(),                type=pa.list_(pa.float32()))
-
-    col_videos = {}
-    for video_key in cameras:
+    for video_key in CAMERAS:
         vid_rel = f"videos/{chunk_str}/{video_key}/{ep_str}.mp4"
-        paths   = [vid_rel] * T
-        tss     = [np.float32(t/fps) for t in range(T)]
-        col_videos[video_key] = pa.StructArray.from_arrays(
-            [pa.array(paths, type=pa.string()), pa.array(tss, type=pa.float32())],
-            fields=[pa.field("path", pa.string()), pa.field("timestamp", pa.float32())]
+        columns[video_key] = pa.StructArray.from_arrays(
+            [
+                pa.array([vid_rel] * T, type=pa.string()),
+                pa.array([np.float32(t / fps) for t in range(T)], type=pa.float32()),
+            ],
+            fields=[pa.field("path", pa.string()), pa.field("timestamp", pa.float32())],
         )
 
-    schema_fields = [
-        pa.field("episode_index",      pa.int64()),
-        pa.field("frame_index",        pa.int64()),
-        pa.field("timestamp",          pa.float32()),
-        pa.field("next.done",          pa.bool_()),
-        pa.field("index",              pa.int64()),
-        pa.field("task_index",         pa.int64()),
-        pa.field("observation.state",  pa.list_(pa.float32())),
-        pa.field("action",             pa.list_(pa.float32())),
-    ] + [pa.field(vk, video_type) for vk in cameras]
-
-    arrays = [
-        col_ep_idx, col_fr_idx, col_ts, col_done,
-        col_index, col_task_idx, col_state, col_action,
-    ] + [col_videos[vk] for vk in cameras]
-
-    table = pa.table(
-        {f.name: arr for f, arr in zip(schema_fields, arrays)},
-        schema=pa.schema(schema_fields),
+    schema = pa.schema(
+        [
+            pa.field("episode_index", pa.int64()),
+            pa.field("frame_index", pa.int64()),
+            pa.field("timestamp", pa.float32()),
+            pa.field("next.done", pa.bool_()),
+            pa.field("index", pa.int64()),
+            pa.field("task_index", pa.int64()),
+            pa.field("observation.state", pa.list_(pa.float32())),
+            pa.field("action", pa.list_(pa.float32())),
+        ] + [pa.field(video_key, video_type) for video_key in CAMERAS]
     )
+    table = pa.table(columns, schema=schema)
 
     parquet_path = out_dir / "data" / chunk_str / f"{ep_str}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, str(parquet_path))
     print(f"Parquet -> {parquet_path}  ({T} rows)")
 
-    # ── meta/info.json ────────────────────────────────────────────────────────
     meta_dir = out_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
+    with open(meta_dir / "episodes.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"episode_index": ep_idx, "tasks": [task], "length": T}) + "\n")
 
-    video_info = {
-        "video.fps":          fps,
-        "video.codec":        "h264",
-        "video.pix_fmt":      "yuv420p",
-        "video.is_depth_map": False,
-        "has_audio":          False,
-    }
-    features = {}
-    for vk in cameras:
-        features[vk] = {
-            "dtype":      "video",
-            "shape":      [H, W, 3],
-            "names":      ["height", "width", "channel"],
-            "video_info": video_info,
-        }
-    features["observation.state"] = {
-        "dtype": "float32", "shape": [14], "names": state_names,
-    }
-    features["action"] = {
-        "dtype": "float32", "shape": [14], "names": action_names,
-    }
-    for col, dtype in [
-        ("episode_index","int64"), ("frame_index","int64"),
-        ("timestamp","float32"),   ("next.done","bool"),
-        ("index","int64"),         ("task_index","int64"),
-    ]:
-        features[col] = {"dtype": dtype, "shape": [1], "names": None}
-
-    # Read existing info to accumulate episode counts when appending
-    info_path = meta_dir / "info.json"
-    if info_path.exists() and ep_idx > 0:
-        with open(info_path) as f:
-            info = json.load(f)
-        info["total_episodes"] = ep_idx + 1
-        info["total_frames"]   = (ep_idx + 1) * T
-        info["total_videos"]   = (ep_idx + 1) * len(cameras)
-        info["total_chunks"]   = chunk + 1
-        info["splits"]         = {"train": f"0:{ep_idx+1}"}
-    else:
-        info = {
-            "codebase_version": "v2.0",
-            "robot_type":       "human",
-            "total_episodes":   ep_idx + 1,
-            "total_frames":     (ep_idx + 1) * T,
-            "total_tasks":      1,
-            "total_videos":     (ep_idx + 1) * len(cameras),
-            "total_chunks":     chunk + 1,
-            "chunks_size":      1000,
-            "fps":              fps,
-            "splits":           {"train": f"0:{ep_idx+1}"},
-            "data_path":        "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-            "video_path":       "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-            "features":         features,
-        }
-    with open(info_path, "w") as f:
-        json.dump(info, f, indent=2)
-
-    # ── meta/episodes.jsonl ───────────────────────────────────────────────────
-    ep_record = {"episode_index": ep_idx, "tasks": [args.task], "length": T}
-    mode = "a" if ep_idx > 0 else "w"
-    with open(meta_dir / "episodes.jsonl", mode) as f:
-        f.write(json.dumps(ep_record) + "\n")
-
-    # ── meta/tasks.jsonl ──────────────────────────────────────────────────────
     tasks_path = meta_dir / "tasks.jsonl"
     if not tasks_path.exists():
-        with open(tasks_path, "w") as f:
-            f.write(json.dumps({"task_index": 0, "task": args.task}) + "\n")
+        with open(tasks_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"task_index": 0, "task": task}) + "\n")
+    return T
 
-    # ── meta/stats.json ───────────────────────────────────────────────────────
-    stats = {
-        "observation.state": compute_stats(states),
-        "action":            compute_stats(actions),
+
+def write_info(out_dir, features, fps, total_episodes, total_frames):
+    meta_dir = out_dir / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    total_chunks = max(1, (total_episodes + 999) // 1000)
+    info = {
+        "codebase_version": "v2.0",
+        "robot_type": "human",
+        "total_episodes": total_episodes,
+        "total_frames": total_frames,
+        "total_tasks": 1,
+        "total_videos": total_episodes * len(CAMERAS),
+        "total_chunks": total_chunks,
+        "chunks_size": 1000,
+        "fps": fps,
+        "splits": {"train": f"0:{total_episodes}"},
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "features": features,
     }
-    with open(meta_dir / "stats.json", "w") as f:
+    with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--data_dir",
+        required=True,
+        help="Single sequence dir or a parent dir containing multiple sequence subdirectories",
+    )
+    ap.add_argument(
+        "--poses",
+        default=None,
+        help="Single .npz path, or a directory containing batch pose files. "
+             "If omitted, each sequence is expected to contain wrist_poses.npz.",
+    )
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--task", default="human ego recovery demonstration")
+    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--episode_index", type=int, default=0, help="Starting episode index for this conversion run")
+    ap.add_argument("--cam_id", default="07", help="Camera folder used to identify valid sequence directories")
+    ap.add_argument("--no_video", action="store_true", help="Skip video encoding (for quick testing)")
+    args = ap.parse_args()
+
+    data_dir = Path(args.data_dir)
+    out_dir = Path(args.output)
+    seq_dirs = discover_sequence_dirs(data_dir, args.cam_id)
+    batch_mode = len(seq_dirs) > 1
+    print(f"Discovered {len(seq_dirs)} sequence(s) under {data_dir}")
+
+    meta_dir = out_dir / "meta"
+    existing_total_frames = 0
+    existing_total_episodes = 0
+    info_path = meta_dir / "info.json"
+    if info_path.exists() and args.episode_index > 0:
+        with open(info_path, encoding="utf-8") as f:
+            existing_info = json.load(f)
+        existing_total_frames = int(existing_info.get("total_frames", 0))
+        existing_total_episodes = int(existing_info.get("total_episodes", 0))
+
+    if args.episode_index == 0:
+        for meta_name in ["episodes.jsonl", "tasks.jsonl"]:
+            meta_path = meta_dir / meta_name
+            if meta_path.exists():
+                meta_path.unlink()
+
+    ep_idx = args.episode_index
+    global_offset = existing_total_frames
+    all_states = []
+    all_actions = []
+    features = None
+
+    for seq_dir in seq_dirs:
+        pose_path = resolve_pose_path(args.poses, seq_dir, batch_mode)
+        print(f"Loading poses for {seq_dir.name} from {pose_path}")
+        left_poses, right_poses, left_gripper, right_gripper, H, W = load_sequence_data(seq_dir, pose_path)
+        states, actions = build_state_action_arrays(left_poses, right_poses, left_gripper, right_gripper)
+        if features is None:
+            features = build_features(H, W, args.fps)
+        T = write_episode(
+            seq_dir,
+            out_dir,
+            args.fps,
+            ep_idx,
+            args.task,
+            args.no_video,
+            global_offset,
+            states,
+            actions,
+        )
+        ep_idx += 1
+        global_offset += T
+        all_states.append(states)
+        all_actions.append(actions)
+
+    total_episodes = max(existing_total_episodes, ep_idx)
+    total_frames = global_offset
+    write_info(out_dir, features, args.fps, total_episodes, total_frames)
+
+    stats = {
+        "observation.state": compute_stats(np.concatenate(all_states, axis=0)),
+        "action": compute_stats(np.concatenate(all_actions, axis=0)),
+    }
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    with open(meta_dir / "stats.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
     print(f"\nDataset written to: {out_dir}")
-    print(f"  episodes={ep_idx+1}  frames={T}  cameras={len(cameras)}")
-    print("\nNext steps:")
-    print("  1. Run extract_wrist_pose.py to get wrist_poses.npz")
-    print("  2. Run visualize_wrist_pose.py to verify accuracy")
-    print("  3. Run this script to build the LeRobot dataset")
-    print("  4. For multiple episodes, re-run with --episode_index 1, 2, ...")
+    print(f"  newly_added_episodes={len(seq_dirs)}  total_episodes={total_episodes}  total_frames={total_frames}")
 
 
 if __name__ == "__main__":
