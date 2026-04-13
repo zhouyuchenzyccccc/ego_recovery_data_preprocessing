@@ -122,14 +122,30 @@ def compute_orientation(lms, depth_img, intr, H, W):
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
     if n1 < 1e-6 or n2 < 1e-6:
         return np.eye(3)
-    v1 /= n1
-    normal = np.cross(v1, v2)
+    y_axis = v1 / n1
+    normal = np.cross(y_axis, v2)
     nn = np.linalg.norm(normal)
     if nn < 1e-6:
         return np.eye(3)
-    normal /= nn
-    v2c = np.cross(normal, v1)
-    return np.stack([v2c, v1, normal], axis=1)
+    z_axis = normal / nn
+
+    # Build a right-handed orthonormal frame:
+    # x = y × z so that x × y = z.
+    x_axis = np.cross(y_axis, z_axis)
+    nx = np.linalg.norm(x_axis)
+    if nx < 1e-6:
+        return np.eye(3)
+    x_axis /= nx
+    y_axis = np.cross(z_axis, x_axis)
+    ny = np.linalg.norm(y_axis)
+    if ny < 1e-6:
+        return np.eye(3)
+    y_axis /= ny
+
+    rot = np.stack([x_axis, y_axis, z_axis], axis=1)
+    if np.linalg.det(rot) < 0:
+        rot[:, 0] *= -1.0
+    return rot
 
 def compute_gripper_distance(lms, depth_img, intr, H, W, wrist_depth):
     """Use thumb/index fingertip distance as a proxy for gripper opening."""
@@ -190,6 +206,10 @@ def resolve_output_path(output_arg, seq_dir, batch_mode):
     output_path = Path(output_arg)
     if not batch_mode and output_path.suffix == ".npz":
         return output_path
+    if batch_mode and output_path.suffix == ".npz":
+        batch_dir = output_path.parent if str(output_path.parent) not in ("", ".") else Path.cwd()
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        return batch_dir / f"{seq_dir.name}_{output_path.name}"
     output_path.mkdir(parents=True, exist_ok=True)
     return output_path / f"{seq_dir.name}_wrist_poses.npz"
 

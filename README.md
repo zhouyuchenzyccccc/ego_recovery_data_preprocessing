@@ -238,3 +238,5 @@ python3 convert_to_lerobot.py \
 ```
 
 If your hardware wiring is swapped, just change the three ids above instead of modifying the code.
+
+Note: in batch mode, if you pass `--output wrist_poses.npz`, the script will save files like `0_wrist_poses.npz`, `1_wrist_poses.npz`, ... in the current directory instead of creating a directory named `wrist_poses.npz`.
