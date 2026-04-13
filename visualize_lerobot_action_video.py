@@ -14,8 +14,11 @@ import json
 from pathlib import Path
 
 import cv2
+import mediapipe as mp
 import numpy as np
 import pyarrow.parquet as pq
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 
 def angle_wrap(values):
@@ -159,6 +162,150 @@ def compute_prediction_error(states, actions, layout):
     return left_err, right_err
 
 
+def create_detector(model_path):
+    base_opts = mp_python.BaseOptions(model_asset_path=model_path)
+    opts = mp_vision.HandLandmarkerOptions(
+        base_options=base_opts,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.HandLandmarker.create_from_options(opts)
+
+
+def detect_wrist_points(detector, frame_bgr):
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+    result = detector.detect(mp_image)
+    H, W = frame_bgr.shape[:2]
+    wrists = {}
+    for lms, handedness in zip(result.hand_landmarks, result.handedness):
+        side = handedness[0].category_name.lower()
+        side = "right" if side == "left" else "left"
+        lm0 = lms[0]
+        u = int(np.clip(lm0.x * W, 0, W - 1))
+        v = int(np.clip(lm0.y * H, 0, H - 1))
+        wrists[side] = (u, v)
+    return wrists
+
+
+def compute_arrow_scale(actions, expected, layout):
+    all_xy = []
+    for side_key in ["left_action_pose", "right_action_pose"]:
+        action_slice = layout[side_key]
+        all_xy.append(actions[:, action_slice][:, :2])
+        all_xy.append(expected[:, action_slice][:, :2])
+    all_xy = np.concatenate(all_xy, axis=0)
+    scale_ref = float(np.percentile(np.abs(all_xy), 95))
+    return 70.0 / max(scale_ref, 1e-4)
+
+
+def draw_arrow(frame, origin, dx, dy, scale, color, label, y_offset):
+    ox, oy = origin
+    end = (int(round(ox + dx * scale)), int(round(oy + dy * scale)))
+    cv2.arrowedLine(frame, (ox, oy), end, color, 2, tipLength=0.25)
+    cv2.putText(
+        frame,
+        label,
+        (ox + 10, oy + y_offset),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_hand_action_overlay(
+    frame,
+    side,
+    wrist_point,
+    stored_pose_action,
+    expected_pose_action,
+    action_error,
+    pose_pred_error,
+    arrow_scale,
+):
+    color_stored = (0, 165, 255)
+    color_expected = (60, 200, 60)
+    color_anchor = (255, 255, 255)
+    ox, oy = wrist_point
+    cv2.circle(frame, wrist_point, 6, color_anchor, 2)
+    cv2.putText(
+        frame,
+        side.upper(),
+        (ox - 18, oy - 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        color_anchor,
+        1,
+        cv2.LINE_AA,
+    )
+
+    draw_arrow(
+        frame,
+        wrist_point,
+        float(stored_pose_action[0]),
+        float(stored_pose_action[1]),
+        arrow_scale,
+        color_stored,
+        f"S dx={stored_pose_action[0]:+.3f} dy={stored_pose_action[1]:+.3f}",
+        18,
+    )
+    draw_arrow(
+        frame,
+        wrist_point,
+        float(expected_pose_action[0]),
+        float(expected_pose_action[1]),
+        arrow_scale,
+        color_expected,
+        f"R dx={expected_pose_action[0]:+.3f} dy={expected_pose_action[1]:+.3f}",
+        36,
+    )
+
+    cv2.putText(
+        frame,
+        f"dz S/R {stored_pose_action[2]:+.3f}/{expected_pose_action[2]:+.3f}",
+        (ox + 10, oy + 54),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (230, 230, 230),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"rot S {stored_pose_action[3]:+.2f},{stored_pose_action[4]:+.2f},{stored_pose_action[5]:+.2f}",
+        (ox + 10, oy + 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        color_stored,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"rot R {expected_pose_action[3]:+.2f},{expected_pose_action[4]:+.2f},{expected_pose_action[5]:+.2f}",
+        (ox + 10, oy + 89),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        color_expected,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"err={action_error:.5f} next_pose_err={pose_pred_error:.5f}",
+        (ox + 10, oy + 107),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        (0, 140, 255) if action_error > 1e-4 else (60, 200, 60),
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def draw_bar(panel, x0, y0, width, height, value, scale, color, label):
     cv2.rectangle(panel, (x0, y0), (x0 + width, y0 + height), (70, 70, 70), 1)
     center = x0 + width // 2
@@ -198,48 +345,22 @@ def draw_header(panel, frame_idx, total_frames, fps, frame_mae, frame_max, left_
     cv2.putText(panel, f"pred next err L/R: {left_pred_err:.5f} / {right_pred_err:.5f}", (18, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
 
 
-def render_panel(frame_idx, total_frames, fps, action_names, actions, expected, errors, scales, left_pred_err, right_pred_err):
-    panel_h = 150 + len(action_names) * 34
-    panel = np.full((panel_h, 620, 3), 24, dtype=np.uint8)
-
-    frame_mae = float(errors[frame_idx].mean())
-    frame_max = float(errors[frame_idx].max())
-    draw_header(
-        panel,
-        frame_idx,
-        total_frames,
-        fps,
-        frame_mae,
-        frame_max,
-        float(left_pred_err[frame_idx]),
-        float(right_pred_err[frame_idx]),
-    )
-
-    y = 170
-    for dim_idx, name in enumerate(action_names):
-        scale = scales[dim_idx]
-        stored = float(actions[frame_idx, dim_idx])
-        recomputed = float(expected[frame_idx, dim_idx])
-        err = float(errors[frame_idx, dim_idx])
-
-        cv2.putText(panel, f"{name}", (18, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (225, 225, 225), 1, cv2.LINE_AA)
-        draw_bar(panel, 180, y - 22, 170, 14, stored, scale, (220, 120, 30), f"stored {stored:+.4f}")
-        draw_bar(panel, 360, y - 22, 170, 14, recomputed, scale, (50, 190, 70), f"recomp {recomputed:+.4f}")
-        err_color = (50, 190, 70) if err < 1e-5 else (0, 140, 255) if err < 1e-3 else (40, 40, 220)
-        cv2.putText(panel, f"err={err:.6f}", (540, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, err_color, 1, cv2.LINE_AA)
-        y += 34
-
-    return panel
+def draw_global_legend(frame, frame_idx, total_frames, fps, frame_mae, frame_max):
+    cv2.rectangle(frame, (12, 12), (540, 92), (20, 20, 20), -1)
+    cv2.putText(frame, f"Frame {frame_idx + 1}/{total_frames}  FPS {fps:.1f}", (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, "Orange=stored action   Green=recomputed-from-state", (24, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"frame MAE={frame_mae:.6f}   frame max err={frame_max:.6f}", (24, 79), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
 
 
-def make_overlay_video(dataset_dir, info, episode_index, video_key, output_path, max_frames):
+def make_overlay_video(dataset_dir, info, episode_index, video_key, output_path, max_frames, model_path):
     parquet_path, video_path = locate_episode_paths(dataset_dir, info, episode_index, video_key)
     states, actions, state_names, action_names = load_episode_arrays(parquet_path, info)
     layout = infer_layout(state_names, action_names)
     expected = recompute_expected_actions(states, layout)
     errors = np.abs(actions - expected)
     left_pred_err, right_pred_err = compute_prediction_error(states, actions, layout)
-    scales = np.maximum(np.max(np.abs(np.concatenate([actions, expected], axis=0)), axis=0), 1e-6)
+    arrow_scale = compute_arrow_scale(actions, expected, layout)
+    detector = create_detector(model_path)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -255,46 +376,40 @@ def make_overlay_video(dataset_dir, info, episode_index, video_key, output_path,
     if not ok:
         raise RuntimeError(f"Failed to read first frame from {video_path}")
     frame_h, frame_w = first_frame.shape[:2]
-    panel = render_panel(0, total_frames, fps, action_names, actions, expected, errors, scales, left_pred_err, right_pred_err)
-    panel_h, panel_w = panel.shape[:2]
-
-    canvas_h = max(frame_h, panel_h)
-    canvas_w = frame_w + panel_w
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (canvas_w, canvas_h))
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_w, frame_h))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    last_wrist_points = {}
     for frame_idx in range(total_frames):
         ok, frame = cap.read()
         if not ok:
             break
-        panel = render_panel(
-            frame_idx,
-            total_frames,
-            fps,
-            action_names,
-            actions,
-            expected,
-            errors,
-            scales,
-            left_pred_err,
-            right_pred_err,
-        )
+        wrist_points = detect_wrist_points(detector, frame)
+        last_wrist_points.update(wrist_points)
+        frame_mae = float(errors[frame_idx].mean())
+        frame_max = float(errors[frame_idx].max())
+        draw_global_legend(frame, frame_idx, total_frames, fps, frame_mae, frame_max)
 
-        canvas = np.full((canvas_h, canvas_w, 3), 18, dtype=np.uint8)
-        canvas[:frame_h, :frame_w] = frame
-        canvas[:panel.shape[0], frame_w:frame_w + panel_w] = panel
-        cv2.putText(
-            canvas,
-            f"Video: {video_key}",
-            (18, canvas_h - 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.54,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-        writer.write(canvas)
+        for side, pose_slice, pred_err in [
+            ("left", layout["left_action_pose"], left_pred_err),
+            ("right", layout["right_action_pose"], right_pred_err),
+        ]:
+            wrist_point = wrist_points.get(side) or last_wrist_points.get(side)
+            if wrist_point is None:
+                continue
+            draw_hand_action_overlay(
+                frame,
+                side,
+                wrist_point,
+                actions[frame_idx, pose_slice],
+                expected[frame_idx, pose_slice],
+                float(np.mean(errors[frame_idx, pose_slice])),
+                float(pred_err[frame_idx]),
+                arrow_scale,
+            )
+
+        writer.write(frame)
 
     cap.release()
     writer.release()
@@ -335,6 +450,11 @@ def main():
     )
     ap.add_argument("--max_frames", type=int, default=None, help="Optional cap for quick debugging")
     ap.add_argument(
+        "--model_path",
+        default="/home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task",
+        help="MediaPipe hand_landmarker.task path for wrist localization on video frames",
+    )
+    ap.add_argument(
         "--output",
         default=None,
         help="Output mp4 path; default is <dataset_dir>/debug_action_video/<episode>_<video_key>.mp4",
@@ -349,7 +469,15 @@ def main():
     else:
         output_path = Path(args.output)
 
-    make_overlay_video(dataset_dir, info, args.episode_index, args.video_key, output_path, args.max_frames)
+    make_overlay_video(
+        dataset_dir,
+        info,
+        args.episode_index,
+        args.video_key,
+        output_path,
+        args.max_frames,
+        args.model_path,
+    )
 
 
 if __name__ == "__main__":
