@@ -240,3 +240,17 @@ python3 convert_to_lerobot.py \
 If your hardware wiring is swapped, just change the three ids above instead of modifying the code.
 
 Note: in batch mode, if you pass `--output wrist_poses.npz`, the script will save files like `0_wrist_poses.npz`, `1_wrist_poses.npz`, ... in the current directory instead of creating a directory named `wrist_poses.npz`.
+
+## Visualize Wrist Pose Overlay
+
+Use the same ego camera id convention as the preprocessing scripts:
+
+```bash
+python3 visualize_wrist_pose.py \
+    --data_dir /path/to/ego2_data \
+    --poses wrist_poses.npz \
+    --output wrist_viz.mp4 \
+    --model_path /path/to/hand_landmarker.task \
+    --ego_cam_id 07 \
+    --fps 30.0
+```

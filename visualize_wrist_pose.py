@@ -27,13 +27,53 @@ HAND_CONNECTIONS = [
     (5,9),(9,13),(13,17),
 ]
 
+def get_by_alias(mapping, aliases):
+    if not isinstance(mapping, dict):
+        return None
+    normalized = {str(k).lower(): v for k, v in mapping.items()}
+    for alias in aliases:
+        if alias.lower() in normalized:
+            return normalized[alias.lower()]
+    return None
+
+def normalize_intrinsic(node):
+    if node is None or not isinstance(node, dict):
+        return None
+    intrinsic = get_by_alias(node, ["intrinsic", "intrinsics"])
+    if intrinsic is None:
+        intrinsic = node
+    if not isinstance(intrinsic, dict):
+        return None
+    result = {}
+    for key in ["fx", "fy", "cx", "cy", "width", "height"]:
+        value = get_by_alias(intrinsic, [key])
+        if value is not None:
+            result[key] = value
+    return result if all(k in result for k in ["fx", "fy", "cx", "cy"]) else None
+
 def load_cam_params(data_dir, cam_id):
     with open(Path(data_dir) / "camera_params.json") as f:
         p = json.load(f)
-    cam = p[cam_id]
+    cam = get_by_alias(p, [cam_id, str(int(cam_id)) if str(cam_id).isdigit() else cam_id])
+    if cam is None:
+        raise KeyError(f"Camera {cam_id} not found in camera_params.json")
+    rgb_intr = (
+        normalize_intrinsic(get_by_alias(cam, ["RGB", "rgb", "color", "Color"]))
+        or normalize_intrinsic(get_by_alias(cam, ["rgb_intrinsic", "color_intrinsic"]))
+        or normalize_intrinsic(cam)
+    )
+    depth_intr = (
+        normalize_intrinsic(get_by_alias(cam, ["Depth", "depth"]))
+        or normalize_intrinsic(get_by_alias(cam, ["depth_intrinsic"]))
+        or rgb_intr
+    )
+    if rgb_intr is None or depth_intr is None:
+        raise KeyError(
+            f"Could not parse RGB/Depth intrinsics for camera {cam_id} from camera_params.json"
+        )
     return {
-        "rgb":   cam["RGB"]["intrinsic"],
-        "depth": cam["Depth"]["intrinsic"],
+        "rgb": rgb_intr,
+        "depth": depth_intr,
     }
 
 def proj(pt3d, intr):
@@ -68,17 +108,28 @@ def main():
     ap.add_argument("--poses",      default="/home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/wrist_poses.npz")
     ap.add_argument("--model_path", default="/home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task")
     ap.add_argument("--output",     default="/home/ubuntu/WorkSpace/ZYC/ego_recovery_data_preprocessing/wrist_viz.mp4")
-    ap.add_argument("--cam_id",     default="07")
+    ap.add_argument("--ego_cam_id", default="07", help="Camera folder id used as the ego view")
+    ap.add_argument("--cam_id",     default=None, help=argparse.SUPPRESS)
     ap.add_argument("--fps",        type=float, default=30.0)
     ap.add_argument("--max_frames", type=int,   default=None)
     args = ap.parse_args()
 
+    ego_cam_id = args.ego_cam_id or args.cam_id or "07"
     data_dir = Path(args.data_dir)
-    params   = load_cam_params(data_dir, args.cam_id)
+    params   = load_cam_params(data_dir, ego_cam_id)
     rgb_intr  = params["rgb"]
     depth_intr = params["depth"]
-    H = int(rgb_intr["height"])
-    W = int(rgb_intr["width"])
+    rgb_files = sorted((data_dir / ego_cam_id / "RGB").glob("*.jpg"))
+    if not rgb_files:
+        raise FileNotFoundError(f"No RGB frames found in {data_dir / ego_cam_id / 'RGB'}")
+    sample_img = cv2.imread(str(rgb_files[0]))
+    if sample_img is None:
+        raise FileNotFoundError(f"Failed to read sample RGB frame: {rgb_files[0]}")
+    H, W = sample_img.shape[:2]
+    rgb_intr.setdefault("height", H)
+    rgb_intr.setdefault("width", W)
+    depth_intr.setdefault("height", H)
+    depth_intr.setdefault("width", W)
 
     data = np.load(args.poses)
     left_poses  = data["left_wrist_poses"]
@@ -86,7 +137,6 @@ def main():
     left_valid  = data["left_valid"]
     right_valid = data["right_valid"]
 
-    rgb_files = sorted((data_dir / args.cam_id / "RGB").glob("*.jpg"))
     if args.max_frames:
         rgb_files = rgb_files[:args.max_frames]
     T = len(rgb_files)
