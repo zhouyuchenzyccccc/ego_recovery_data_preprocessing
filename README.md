@@ -210,3 +210,31 @@ python3 extract_wrist_pose.py \
     --cam_id 07 \
     --smooth_method median_then_savgol
 ```
+
+## Explicit Camera Mapping
+
+If camera ids 06 / 07 / 08 may be swapped, always pass the camera mapping explicitly.
+
+### Extract wrist pose from the ego camera
+
+```bash
+python3 extract_wrist_pose.py \
+    --data_dir /path/to/ego2_data \
+    --output wrist_poses.npz \
+    --ego_cam_id 07 \
+    --smooth_method median_then_savgol
+```
+
+### Convert to LeRobot with explicit video-camera mapping
+
+```bash
+python3 convert_to_lerobot.py \
+    --data_dir /path/to/ego2_data \
+    --output lerobot_dataset \
+    --ego_cam_id 07 \
+    --left_wrist_cam_id 06 \
+    --right_wrist_cam_id 08 \
+    --task "hand success insertion"
+```
+
+If your hardware wiring is swapped, just change the three ids above instead of modifying the code.

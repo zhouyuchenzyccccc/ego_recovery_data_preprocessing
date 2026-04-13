@@ -25,11 +25,11 @@ VIDEO_CODEC = "libx264"
 VIDEO_PIX_FMT = "yuv420p"
 VIDEO_CRF = "18"
 
-CAMERAS = {
-    "observation.images.cam_high": ("07", "RGB"),
-    "observation.images.cam_left_wrist": ("06", "RGB"),
-    "observation.images.cam_right_wrist": ("08", "RGB"),
-}
+VIDEO_KEYS = [
+    "observation.images.cam_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+]
 
 STATE_NAMES = [
     "left_x", "left_y", "left_z", "left_rx", "left_ry", "left_rz", "left_gripper",
@@ -82,6 +82,14 @@ def image_stats():
         "std": [[[0.5]], [[0.5]], [[0.5]]],
         "min": [[[0.0]], [[0.0]], [[0.0]]],
         "max": [[[1.0]], [[1.0]], [[1.0]]],
+    }
+
+
+def build_camera_mapping(ego_cam_id, left_wrist_cam_id, right_wrist_cam_id):
+    return {
+        "observation.images.cam_high": (str(ego_cam_id), "RGB"),
+        "observation.images.cam_left_wrist": (str(left_wrist_cam_id), "RGB"),
+        "observation.images.cam_right_wrist": (str(right_wrist_cam_id), "RGB"),
     }
 
 
@@ -208,7 +216,7 @@ def build_absolute_actions(states):
     return actions
 
 
-def load_sequence_data(seq_dir, pose_path, fallback_source_fps):
+def load_sequence_data(seq_dir, pose_path, fallback_source_fps, ego_cam_id):
     pose_data = np.load(pose_path)
     left_poses = pose_data["left_wrist_poses"].astype(np.float32)
     right_poses = pose_data["right_wrist_poses"].astype(np.float32)
@@ -225,7 +233,10 @@ def load_sequence_data(seq_dir, pose_path, fallback_source_fps):
 
     with open(seq_dir / "camera_params.json", encoding="utf-8") as f:
         cam_params = json.load(f)
-    cam = get_by_alias(cam_params, ["07", "7"])
+    ego_aliases = [str(ego_cam_id)]
+    if str(ego_cam_id).isdigit():
+        ego_aliases.append(str(int(ego_cam_id)))
+    cam = get_by_alias(cam_params, ego_aliases)
     rgb_intr = (
         normalize_intrinsic(get_by_alias(cam, ["RGB", "rgb", "color", "Color"]))
         or normalize_intrinsic(get_by_alias(cam, ["rgb_intrinsic", "color_intrinsic"]))
@@ -235,9 +246,9 @@ def load_sequence_data(seq_dir, pose_path, fallback_source_fps):
         H = int(rgb_intr["height"])
         W = int(rgb_intr["width"])
     else:
-        sample_rgb = next((seq_dir / "07" / "RGB").glob("*.jpg"), None)
+        sample_rgb = next((seq_dir / str(ego_cam_id) / "RGB").glob("*.jpg"), None)
         if sample_rgb is None:
-            raise FileNotFoundError(f"No RGB frames found in {seq_dir / '07' / 'RGB'}")
+            raise FileNotFoundError(f"No RGB frames found in {seq_dir / str(ego_cam_id) / 'RGB'}")
         image = cv2.imread(str(sample_rgb))
         if image is None:
             raise FileNotFoundError(f"Failed to read sample RGB frame: {sample_rgb}")
@@ -301,13 +312,13 @@ def write_video_from_paths(frame_paths, selected_indices, out_path, fps):
         raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}) for {out_path}")
 
 
-def write_episode(seq_dir, out_dir, episode_index, task, states, actions, fps, source_fps, target_len, global_offset, no_video):
+def write_episode(seq_dir, out_dir, episode_index, task, states, actions, fps, source_fps, target_len, global_offset, no_video, camera_mapping):
     chunk_idx = episode_index // CHUNKS_SIZE
     chunk_str = f"chunk-{chunk_idx:03d}"
     ep_str = f"episode_{episode_index:06d}"
 
     if not no_video:
-        for video_key, (cam_id, modality) in CAMERAS.items():
+        for video_key, (cam_id, modality) in camera_mapping.items():
             frame_paths = sorted((seq_dir / cam_id / modality).glob("*.jpg"))
             if not frame_paths:
                 raise FileNotFoundError(f"No frames found in {seq_dir / cam_id / modality}")
@@ -380,7 +391,7 @@ def build_info(H, W, total_episodes, total_frames, fps):
                 "shape": [14],
                 "names": STATE_NAMES,
             },
-            **{video_key: video_feature() for video_key in CAMERAS},
+            **{video_key: video_feature() for video_key in VIDEO_KEYS},
             "timestamp": {"dtype": "float64", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64", "shape": [1], "names": None},
             "episode_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -416,7 +427,9 @@ def main():
     ap.add_argument("--source_fps", type=float, default=30.0, help="Fallback source FPS if pose file does not contain fps")
     ap.add_argument("--target_fps", type=float, default=TARGET_FPS_DEFAULT, help="Target FPS, should match robot data")
     ap.add_argument("--episode_index", type=int, default=0, help="Starting episode index for this conversion run")
-    ap.add_argument("--cam_id", default="07", help="Camera folder used to identify valid sequence directories")
+    ap.add_argument("--ego_cam_id", default="07", help="Camera folder id used as the ego/top view")
+    ap.add_argument("--left_wrist_cam_id", default="06", help="Camera folder id used as the left wrist view")
+    ap.add_argument("--right_wrist_cam_id", default="08", help="Camera folder id used as the right wrist view")
     ap.add_argument("--no_video", action="store_true", help="Skip video encoding (for quick testing)")
     args = ap.parse_args()
 
@@ -425,9 +438,16 @@ def main():
 
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output)
-    seq_dirs = discover_sequence_dirs(data_dir, args.cam_id)
+    camera_mapping = build_camera_mapping(args.ego_cam_id, args.left_wrist_cam_id, args.right_wrist_cam_id)
+    seq_dirs = discover_sequence_dirs(data_dir, args.ego_cam_id)
     batch_mode = len(seq_dirs) > 1
     print(f"Discovered {len(seq_dirs)} sequence(s) under {data_dir}")
+    print(
+        "Camera mapping: "
+        f"cam_high->{args.ego_cam_id}, "
+        f"cam_left_wrist->{args.left_wrist_cam_id}, "
+        f"cam_right_wrist->{args.right_wrist_cam_id}"
+    )
 
     meta_dir = out_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -451,7 +471,9 @@ def main():
         episode_index = args.episode_index + seq_offset
         pose_path = resolve_pose_path(args.poses, seq_dir, batch_mode)
         print(f"Loading poses for {seq_dir.name} from {pose_path}")
-        states, actions, H, W, source_fps, target_len = load_sequence_data(seq_dir, pose_path, args.source_fps)
+        states, actions, H, W, source_fps, target_len = load_sequence_data(
+            seq_dir, pose_path, args.source_fps, args.ego_cam_id
+        )
         if info_H is None:
             info_H, info_W = H, W
 
@@ -467,6 +489,7 @@ def main():
             target_len,
             total_frames,
             args.no_video,
+            camera_mapping,
         )
         episodes_meta.append({"episode_index": episode_index, "tasks": [args.task], "length": written_frames})
         total_frames += written_frames
@@ -480,7 +503,7 @@ def main():
     stats = {
         "observation.state": compute_stats(np.concatenate(all_states, axis=0)),
         "action": compute_stats(np.concatenate(all_actions, axis=0)),
-        **{video_key: image_stats() for video_key in CAMERAS},
+        **{video_key: image_stats() for video_key in VIDEO_KEYS},
     }
     with open(meta_dir / "stats.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)

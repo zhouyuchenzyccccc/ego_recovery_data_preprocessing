@@ -287,13 +287,15 @@ def main():
                     help="For single sequence: output .npz path. For batch mode: output directory. "
                          "If omitted, saves wrist_poses.npz inside each sequence directory.")
     ap.add_argument("--model_path", default="/home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task")
-    ap.add_argument("--cam_id", default="07")
+    ap.add_argument("--ego_cam_id", default="07", help="Camera folder id used as the ego view for hand pose extraction")
+    ap.add_argument("--cam_id", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--smooth_method", default="median_then_savgol",
                     choices=["savgol","ema","median_then_savgol","none"])
     args = ap.parse_args()
 
+    ego_cam_id = args.ego_cam_id or args.cam_id or "07"
     data_dir = Path(args.data_dir)
-    seq_dirs = discover_sequence_dirs(data_dir, args.cam_id)
+    seq_dirs = discover_sequence_dirs(data_dir, ego_cam_id)
     batch_mode = len(seq_dirs) > 1
 
     base_opts = mp_python.BaseOptions(model_asset_path=args.model_path)
@@ -306,9 +308,10 @@ def main():
     detector = mp_vision.HandLandmarker.create_from_options(opts)
 
     print(f"Discovered {len(seq_dirs)} sequence(s) under {data_dir}")
+    print(f"Ego camera mapping: cam_high->{ego_cam_id}")
     for seq_dir in seq_dirs:
         out = resolve_output_path(args.output, seq_dir, batch_mode)
-        process_sequence(seq_dir, out, detector, args.cam_id, args.smooth_method)
+        process_sequence(seq_dir, out, detector, ego_cam_id, args.smooth_method)
 
 if __name__ == "__main__":
     main()
