@@ -1,25 +1,45 @@
 #!/usr/bin/env python3
 """
-Convert ego data + extracted wrist poses to LeRobot v2 dataset format.
+Convert human ego-hand data to LeRobot v2.0 format with robot-aligned schema.
 
-Supports either:
-1. A single sequence directory with one pose file, or
-2. A parent directory whose immediate children are multiple sequence directories.
+Key design choices:
+1. `observation.state` is absolute 14-D wrist pose + gripper state.
+2. `action` is also absolute 14-D target pose, stored as next-frame absolute pose.
+3. All resampling happens in absolute pose space.
+4. Videos are resampled to target FPS with nearest-neighbor frame repetition.
 """
 import argparse
 import json
 import subprocess
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+TARGET_FPS_DEFAULT = 50.0
+CHUNKS_SIZE = 1000
+ROBOT_TYPE = "human"
+VIDEO_CODEC = "libx264"
+VIDEO_PIX_FMT = "yuv420p"
+VIDEO_CRF = "18"
+
 CAMERAS = {
-    "observation.images.ego":        ("07", "RGB"),
-    "observation.images.left_hand":  ("06", "RGB"),
-    "observation.images.right_hand": ("08", "RGB"),
+    "observation.images.cam_high": ("07", "RGB"),
+    "observation.images.cam_left_wrist": ("06", "RGB"),
+    "observation.images.cam_right_wrist": ("08", "RGB"),
 }
+
+STATE_NAMES = [
+    "left_x", "left_y", "left_z", "left_rx", "left_ry", "left_rz", "left_gripper",
+    "right_x", "right_y", "right_z", "right_rx", "right_ry", "right_rz", "right_gripper",
+]
+
+
+def sort_key(path):
+    return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
+
 
 def get_by_alias(mapping, aliases):
     if not isinstance(mapping, dict):
@@ -30,10 +50,9 @@ def get_by_alias(mapping, aliases):
             return normalized[alias.lower()]
     return None
 
+
 def normalize_intrinsic(node):
-    if node is None:
-        return None
-    if not isinstance(node, dict):
+    if node is None or not isinstance(node, dict):
         return None
     intrinsic = get_by_alias(node, ["intrinsic", "intrinsics"])
     if intrinsic is None:
@@ -48,86 +67,21 @@ def normalize_intrinsic(node):
     return result if all(k in result for k in ["fx", "fy", "cx", "cy"]) else None
 
 
-def sort_key(path):
-    return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
-
-
-def angle_wrap(a):
-    return (a + np.pi) % (2 * np.pi) - np.pi
-
-
-def compute_delta(poses):
-    """(T,6) absolute -> (T,6) delta; last frame repeats second-to-last."""
-    if len(poses) == 0:
-        return np.zeros_like(poses)
-    if len(poses) == 1:
-        return np.zeros_like(poses)
-    delta = np.zeros_like(poses)
-    delta[:-1] = poses[1:] - poses[:-1]
-    delta[:-1, 3:6] = angle_wrap(delta[:-1, 3:6])
-    delta[-1] = delta[-2]
-    return delta
-
-
-def map_finger_distance_to_gripper(finger_dist, close_threshold=0.03, open_threshold=0.08):
-    """Map thumb-index distance in meters to an ALOHA-like [0, 1] gripper signal."""
-    if finger_dist <= close_threshold:
-        return np.float32(0.0)
-    if finger_dist >= open_threshold:
-        return np.float32(1.0)
-    value = (finger_dist - close_threshold) / (open_threshold - close_threshold)
-    return np.float32(np.clip(value, 0.0, 1.0))
-
-
-def build_human_actions(left_poses, right_poses, left_gripper, right_gripper):
-    """Construct 14-D actions to match the guide: pose delta + next-frame gripper."""
-    left_delta = compute_delta(left_poses)
-    right_delta = compute_delta(right_poses)
-    left_gripper_cmd = np.array(
-        [map_finger_distance_to_gripper(v) for v in left_gripper],
-        dtype=np.float32,
-    )
-    right_gripper_cmd = np.array(
-        [map_finger_distance_to_gripper(v) for v in right_gripper],
-        dtype=np.float32,
-    )
-    return np.concatenate(
-        [
-            left_delta,
-            left_gripper_cmd[:, None],
-            right_delta,
-            right_gripper_cmd[:, None],
-        ],
-        axis=1,
-    )
-
-
-def encode_video(img_dir, out_path, fps):
-    """Encode image sequence (00000.jpg ...) to mp4 with libx264."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i", str(img_dir / "%05d.jpg"),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        "-preset", "fast",
-        str(out_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ffmpeg stderr: {result.stderr[-400:]}")
-        raise RuntimeError(f"ffmpeg failed for {out_path}")
-
-
 def compute_stats(arr):
-    """arr: (T, D) float32 -> dict with mean/std/min/max per dim."""
     return {
         "mean": arr.mean(axis=0).tolist(),
         "std": arr.std(axis=0).clip(1e-6).tolist(),
         "min": arr.min(axis=0).tolist(),
         "max": arr.max(axis=0).tolist(),
+    }
+
+
+def image_stats():
+    return {
+        "mean": [[[0.5]], [[0.5]], [[0.5]]],
+        "std": [[[0.5]], [[0.5]], [[0.5]]],
+        "min": [[[0.0]], [[0.0]], [[0.0]]],
+        "max": [[[1.0]], [[1.0]], [[1.0]]],
     }
 
 
@@ -175,7 +129,86 @@ def resolve_pose_path(poses_arg, seq_dir, batch_mode):
     )
 
 
-def load_sequence_data(data_dir, pose_path):
+def map_finger_distance_to_gripper(finger_dist, close_threshold=0.03, open_threshold=0.08):
+    if finger_dist <= close_threshold:
+        return np.float32(0.0)
+    if finger_dist >= open_threshold:
+        return np.float32(1.0)
+    value = (finger_dist - close_threshold) / (open_threshold - close_threshold)
+    return np.float32(np.clip(value, 0.0, 1.0))
+
+
+def maybe_convert_mm_to_m(poses, seq_name):
+    poses = poses.copy()
+    pos = poses[:, :3]
+    abs_pos_p95 = float(np.percentile(np.abs(pos), 95))
+    delta_p95 = float(np.percentile(np.abs(np.diff(pos, axis=0)), 95)) if len(pos) > 1 else 0.0
+    if abs_pos_p95 > 10.0 or delta_p95 > 1.0:
+        poses[:, :3] /= 1000.0
+        print(
+            f"[unit-fix] Sequence {seq_name}: detected likely millimeter positions "
+            f"(p95 abs={abs_pos_p95:.3f}, p95 delta={delta_p95:.3f}), converted to meters."
+        )
+    return poses
+
+
+def build_absolute_state(left_poses, right_poses, left_gripper, right_gripper, seq_name):
+    left_poses = maybe_convert_mm_to_m(left_poses, f"{seq_name}/left")
+    right_poses = maybe_convert_mm_to_m(right_poses, f"{seq_name}/right")
+    left_gripper = np.array([map_finger_distance_to_gripper(v) for v in left_gripper], dtype=np.float32)
+    right_gripper = np.array([map_finger_distance_to_gripper(v) for v in right_gripper], dtype=np.float32)
+    return np.concatenate(
+        [
+            left_poses[:, :6],
+            left_gripper[:, None],
+            right_poses[:, :6],
+            right_gripper[:, None],
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def unwrap_pose_angles(states):
+    states = states.copy()
+    states[:, 3:6] = np.unwrap(states[:, 3:6], axis=0)
+    states[:, 10:13] = np.unwrap(states[:, 10:13], axis=0)
+    return states
+
+
+def resample_absolute_states(states, source_fps, target_fps):
+    source_len = len(states)
+    if source_len == 0:
+        return states
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError("source_fps and target_fps must be positive")
+
+    target_len = max(1, int(round(source_len * target_fps / source_fps)))
+    if target_len == source_len and abs(source_fps - target_fps) < 1e-8:
+        return states.astype(np.float32)
+
+    states_unwrapped = unwrap_pose_angles(states)
+    source_times = np.arange(source_len, dtype=np.float64) / source_fps
+    target_times = np.arange(target_len, dtype=np.float64) / target_fps
+
+    resampled = np.zeros((target_len, states.shape[1]), dtype=np.float32)
+    for dim in range(states.shape[1]):
+        resampled[:, dim] = np.interp(target_times, source_times, states_unwrapped[:, dim]).astype(np.float32)
+    return resampled
+
+
+def build_absolute_actions(states):
+    actions = np.zeros_like(states, dtype=np.float32)
+    if len(states) == 0:
+        return actions
+    if len(states) == 1:
+        actions[0] = states[0]
+        return actions
+    actions[:-1] = states[1:]
+    actions[-1] = states[-1]
+    return actions
+
+
+def load_sequence_data(seq_dir, pose_path, fallback_source_fps):
     pose_data = np.load(pose_path)
     left_poses = pose_data["left_wrist_poses"].astype(np.float32)
     right_poses = pose_data["right_wrist_poses"].astype(np.float32)
@@ -186,10 +219,11 @@ def load_sequence_data(data_dir, pose_path):
         )
     left_gripper = pose_data["left_gripper"].astype(np.float32)
     right_gripper = pose_data["right_gripper"].astype(np.float32)
+    source_fps = float(pose_data["fps"]) if "fps" in pose_data else float(fallback_source_fps)
     if not (len(left_poses) == len(right_poses) == len(left_gripper) == len(right_gripper)):
         raise ValueError(f"Pose length mismatch in {pose_path}")
 
-    with open(data_dir / "camera_params.json", encoding="utf-8") as f:
+    with open(seq_dir / "camera_params.json", encoding="utf-8") as f:
         cam_params = json.load(f)
     cam = get_by_alias(cam_params, ["07", "7"])
     rgb_intr = (
@@ -201,188 +235,167 @@ def load_sequence_data(data_dir, pose_path):
         H = int(rgb_intr["height"])
         W = int(rgb_intr["width"])
     else:
-        sample_rgb = next((data_dir / "07" / "RGB").glob("*.jpg"), None)
+        sample_rgb = next((seq_dir / "07" / "RGB").glob("*.jpg"), None)
         if sample_rgb is None:
-            raise FileNotFoundError(f"No RGB frames found in {data_dir / '07' / 'RGB'}")
-        import cv2
+            raise FileNotFoundError(f"No RGB frames found in {seq_dir / '07' / 'RGB'}")
         image = cv2.imread(str(sample_rgb))
         if image is None:
             raise FileNotFoundError(f"Failed to read sample RGB frame: {sample_rgb}")
         H, W = image.shape[:2]
-    return left_poses, right_poses, left_gripper, right_gripper, H, W
+
+    states = build_absolute_state(left_poses, right_poses, left_gripper, right_gripper, seq_dir.name)
+    states = resample_absolute_states(states, source_fps, TARGET_FPS_DEFAULT)
+    actions = build_absolute_actions(states)
+    target_len = len(states)
+    return states, actions, H, W, source_fps, target_len
 
 
-def build_state_action_arrays(left_poses, right_poses, left_gripper, right_gripper):
-    left_gripper_state = np.array(
-        [map_finger_distance_to_gripper(v) for v in left_gripper],
-        dtype=np.float32,
+def build_target_frame_indices(source_len, source_fps, target_len, target_fps):
+    if source_len == 0:
+        return np.array([], dtype=np.int64)
+    source_times = np.arange(source_len, dtype=np.float64) / source_fps
+    target_times = np.arange(target_len, dtype=np.float64) / target_fps
+    indices = np.searchsorted(source_times, target_times, side="left")
+    indices = np.clip(indices, 0, source_len - 1)
+    prev_indices = np.clip(indices - 1, 0, source_len - 1)
+    prev_dist = np.abs(target_times - source_times[prev_indices])
+    next_dist = np.abs(target_times - source_times[indices])
+    use_prev = prev_dist <= next_dist
+    return np.where(use_prev, prev_indices, indices).astype(np.int64)
+
+
+def write_video_from_paths(frame_paths, selected_indices, out_path, fps):
+    if len(selected_indices) == 0:
+        raise ValueError("selected_indices is empty")
+    first_frame = cv2.imread(str(frame_paths[int(selected_indices[0])]))
+    if first_frame is None:
+        raise FileNotFoundError(f"Failed to read frame: {frame_paths[int(selected_indices[0])]}")
+    H, W = first_frame.shape[:2]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{W}x{H}", "-pix_fmt", "bgr24", "-r", str(fps),
+        "-i", "pipe:0",
+        "-vcodec", VIDEO_CODEC,
+        "-pix_fmt", VIDEO_PIX_FMT,
+        "-crf", VIDEO_CRF,
+        str(out_path),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    right_gripper_state = np.array(
-        [map_finger_distance_to_gripper(v) for v in right_gripper],
-        dtype=np.float32,
-    )
-    states = np.concatenate(
-        [
-            left_poses,
-            left_gripper_state[:, None],
-            right_poses,
-            right_gripper_state[:, None],
-        ],
-        axis=1,
-    )
-    actions = build_human_actions(left_poses, right_poses, left_gripper, right_gripper)
-    return states, actions
+    try:
+        for idx in selected_indices:
+            frame = cv2.imread(str(frame_paths[int(idx)]))
+            if frame is None:
+                raise FileNotFoundError(f"Failed to read frame: {frame_paths[int(idx)]}")
+            proc.stdin.write(frame.tobytes())
+    finally:
+        proc.stdin.close()
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}) for {out_path}")
 
 
-def get_feature_names():
-    state_names = (
-        [f"left_wrist_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
-        + ["left_gripper"]
-        + [f"right_wrist_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
-        + ["right_gripper"]
-    )
-    action_names = (
-        [f"left_delta_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
-        + ["left_gripper"]
-        + [f"right_delta_{k}" for k in ["x", "y", "z", "rx", "ry", "rz"]]
-        + ["right_gripper"]
-    )
-    return state_names, action_names
-
-
-def build_features(H, W, fps):
-    state_names, action_names = get_feature_names()
-    video_info = {
-        "video.fps": fps,
-        "video.codec": "h264",
-        "video.pix_fmt": "yuv420p",
-        "video.is_depth_map": False,
-        "has_audio": False,
-    }
-    features = {}
-    for video_key in CAMERAS:
-        features[video_key] = {
-            "dtype": "video",
-            "shape": [H, W, 3],
-            "names": ["height", "width", "channel"],
-            "video_info": video_info,
-        }
-    features["observation.state"] = {
-        "dtype": "float32",
-        "shape": [14],
-        "names": state_names,
-    }
-    features["action"] = {
-        "dtype": "float32",
-        "shape": [14],
-        "names": action_names,
-    }
-    for col, dtype in [
-        ("episode_index", "int64"),
-        ("frame_index", "int64"),
-        ("timestamp", "float32"),
-        ("next.done", "bool"),
-        ("index", "int64"),
-        ("task_index", "int64"),
-    ]:
-        features[col] = {"dtype": dtype, "shape": [1], "names": None}
-    return features
-
-
-def write_episode(data_dir, out_dir, fps, ep_idx, task, no_video, global_offset, states, actions):
-    T = len(states)
-    chunk = ep_idx // 1000
-    ep_str = f"episode_{ep_idx:06d}"
-    chunk_str = f"chunk-{chunk:03d}"
+def write_episode(seq_dir, out_dir, episode_index, task, states, actions, fps, source_fps, target_len, global_offset, no_video):
+    chunk_idx = episode_index // CHUNKS_SIZE
+    chunk_str = f"chunk-{chunk_idx:03d}"
+    ep_str = f"episode_{episode_index:06d}"
 
     if not no_video:
         for video_key, (cam_id, modality) in CAMERAS.items():
-            img_dir = data_dir / cam_id / modality
-            vid_path = out_dir / "videos" / chunk_str / video_key / f"{ep_str}.mp4"
-            print(f"Encoding {video_key} for {data_dir.name} ...")
-            encode_video(img_dir, vid_path, fps)
-            print(f"  -> {vid_path}")
+            frame_paths = sorted((seq_dir / cam_id / modality).glob("*.jpg"))
+            if not frame_paths:
+                raise FileNotFoundError(f"No frames found in {seq_dir / cam_id / modality}")
+            selected_indices = build_target_frame_indices(len(frame_paths), source_fps, target_len, fps)
+            video_path = out_dir / "videos" / chunk_str / video_key / f"{ep_str}.mp4"
+            print(f"Encoding {video_key} for {seq_dir.name} ...")
+            write_video_from_paths(frame_paths, selected_indices, video_path, fps)
+            print(f"  -> {video_path}")
     else:
-        print(f"Skipping video encoding for {data_dir.name} (--no_video)")
+        print(f"Skipping video encoding for {seq_dir.name} (--no_video)")
 
-    video_type = pa.struct([
-        pa.field("path", pa.string()),
-        pa.field("timestamp", pa.float32()),
-    ])
+    parquet_dir = out_dir / "data" / chunk_str
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+    T = len(states)
+    timestamps = np.arange(T, dtype=np.float64) / fps
+    frame_indices = np.arange(T, dtype=np.int64)
+    episode_indices = np.full(T, episode_index, dtype=np.int64)
+    global_indices = np.arange(global_offset, global_offset + T, dtype=np.int64)
+    task_indices = np.zeros(T, dtype=np.int64)
 
-    columns = {
-        "episode_index": pa.array([ep_idx] * T, type=pa.int64()),
-        "frame_index": pa.array(list(range(T)), type=pa.int64()),
-        "timestamp": pa.array([np.float32(t / fps) for t in range(T)], type=pa.float32()),
-        "next.done": pa.array([False] * (T - 1) + [True], type=pa.bool_()),
-        "index": pa.array(list(range(global_offset, global_offset + T)), type=pa.int64()),
-        "task_index": pa.array([0] * T, type=pa.int64()),
+    table = pa.table({
         "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32())),
         "action": pa.array(actions.tolist(), type=pa.list_(pa.float32())),
-    }
-
-    for video_key in CAMERAS:
-        vid_rel = f"videos/{chunk_str}/{video_key}/{ep_str}.mp4"
-        columns[video_key] = pa.StructArray.from_arrays(
-            [
-                pa.array([vid_rel] * T, type=pa.string()),
-                pa.array([np.float32(t / fps) for t in range(T)], type=pa.float32()),
-            ],
-            fields=[pa.field("path", pa.string()), pa.field("timestamp", pa.float32())],
-        )
-
-    schema = pa.schema(
-        [
-            pa.field("episode_index", pa.int64()),
-            pa.field("frame_index", pa.int64()),
-            pa.field("timestamp", pa.float32()),
-            pa.field("next.done", pa.bool_()),
-            pa.field("index", pa.int64()),
-            pa.field("task_index", pa.int64()),
-            pa.field("observation.state", pa.list_(pa.float32())),
-            pa.field("action", pa.list_(pa.float32())),
-        ] + [pa.field(video_key, video_type) for video_key in CAMERAS]
-    )
-    table = pa.table(columns, schema=schema)
-
-    parquet_path = out_dir / "data" / chunk_str / f"{ep_str}.parquet"
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, str(parquet_path))
+        "timestamp": pa.array(timestamps),
+        "frame_index": pa.array(frame_indices),
+        "episode_index": pa.array(episode_indices),
+        "index": pa.array(global_indices),
+        "task_index": pa.array(task_indices),
+    })
+    parquet_path = parquet_dir / f"{ep_str}.parquet"
+    pq.write_table(table, parquet_path)
     print(f"Parquet -> {parquet_path}  ({T} rows)")
-
-    meta_dir = out_dir / "meta"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    with open(meta_dir / "episodes.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps({"episode_index": ep_idx, "tasks": [task], "length": T}) + "\n")
-
-    tasks_path = meta_dir / "tasks.jsonl"
-    if not tasks_path.exists():
-        with open(tasks_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"task_index": 0, "task": task}) + "\n")
     return T
 
 
-def write_info(out_dir, features, fps, total_episodes, total_frames):
-    meta_dir = out_dir / "meta"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    total_chunks = max(1, (total_episodes + 999) // 1000)
-    info = {
+def build_info(H, W, total_episodes, total_frames, fps):
+    total_chunks = max(1, (total_episodes + CHUNKS_SIZE - 1) // CHUNKS_SIZE)
+
+    def video_feature():
+        return {
+            "dtype": "video",
+            "shape": [3, H, W],
+            "names": ["channels", "height", "width"],
+            "info": {
+                "video.fps": float(fps),
+                "video.height": H,
+                "video.width": W,
+                "video.channels": 3,
+                "video.codec": VIDEO_CODEC,
+                "video.pix_fmt": VIDEO_PIX_FMT,
+                "video.is_depth_map": False,
+                "has_audio": False,
+            },
+        }
+
+    return {
         "codebase_version": "v2.0",
-        "robot_type": "human",
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "robot_type": ROBOT_TYPE,
+        "fps": float(fps),
+        "features": {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": [14],
+                "names": STATE_NAMES,
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": [14],
+                "names": STATE_NAMES,
+            },
+            **{video_key: video_feature() for video_key in CAMERAS},
+            "timestamp": {"dtype": "float64", "shape": [1], "names": None},
+            "frame_index": {"dtype": "int64", "shape": [1], "names": None},
+            "episode_index": {"dtype": "int64", "shape": [1], "names": None},
+            "index": {"dtype": "int64", "shape": [1], "names": None},
+            "task_index": {"dtype": "int64", "shape": [1], "names": None},
+        },
         "total_episodes": total_episodes,
         "total_frames": total_frames,
         "total_tasks": 1,
-        "total_videos": total_episodes * len(CAMERAS),
         "total_chunks": total_chunks,
-        "chunks_size": 1000,
-        "fps": fps,
+        "chunks_size": CHUNKS_SIZE,
         "splits": {"train": f"0:{total_episodes}"},
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features": features,
+        "license": "apache-2.0",
+        "tags": [],
     }
-    with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
-        json.dump(info, f, indent=2)
 
 
 def main():
@@ -400,11 +413,15 @@ def main():
     )
     ap.add_argument("--output", required=True)
     ap.add_argument("--task", default="human ego recovery demonstration")
-    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--source_fps", type=float, default=30.0, help="Fallback source FPS if pose file does not contain fps")
+    ap.add_argument("--target_fps", type=float, default=TARGET_FPS_DEFAULT, help="Target FPS, should match robot data")
     ap.add_argument("--episode_index", type=int, default=0, help="Starting episode index for this conversion run")
     ap.add_argument("--cam_id", default="07", help="Camera folder used to identify valid sequence directories")
     ap.add_argument("--no_video", action="store_true", help="Skip video encoding (for quick testing)")
     args = ap.parse_args()
+
+    if abs(args.target_fps - TARGET_FPS_DEFAULT) > 1e-8:
+        raise ValueError(f"This script is configured to output 50 FPS. Received target_fps={args.target_fps}.")
 
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output)
@@ -413,64 +430,67 @@ def main():
     print(f"Discovered {len(seq_dirs)} sequence(s) under {data_dir}")
 
     meta_dir = out_dir / "meta"
-    existing_total_frames = 0
-    existing_total_episodes = 0
-    info_path = meta_dir / "info.json"
-    if info_path.exists() and args.episode_index > 0:
-        with open(info_path, encoding="utf-8") as f:
-            existing_info = json.load(f)
-        existing_total_frames = int(existing_info.get("total_frames", 0))
-        existing_total_episodes = int(existing_info.get("total_episodes", 0))
-
+    meta_dir.mkdir(parents=True, exist_ok=True)
     if args.episode_index == 0:
         for meta_name in ["episodes.jsonl", "tasks.jsonl"]:
             meta_path = meta_dir / meta_name
             if meta_path.exists():
                 meta_path.unlink()
 
-    ep_idx = args.episode_index
-    global_offset = existing_total_frames
+    with open(meta_dir / "tasks.jsonl", "w", encoding="utf-8") as f:
+        f.write(json.dumps({"task_index": 0, "task": args.task}) + "\n")
+
+    episodes_meta = []
+    total_frames = 0
     all_states = []
     all_actions = []
-    features = None
+    info_H = None
+    info_W = None
 
-    for seq_dir in seq_dirs:
+    for seq_offset, seq_dir in enumerate(seq_dirs):
+        episode_index = args.episode_index + seq_offset
         pose_path = resolve_pose_path(args.poses, seq_dir, batch_mode)
         print(f"Loading poses for {seq_dir.name} from {pose_path}")
-        left_poses, right_poses, left_gripper, right_gripper, H, W = load_sequence_data(seq_dir, pose_path)
-        states, actions = build_state_action_arrays(left_poses, right_poses, left_gripper, right_gripper)
-        if features is None:
-            features = build_features(H, W, args.fps)
-        T = write_episode(
+        states, actions, H, W, source_fps, target_len = load_sequence_data(seq_dir, pose_path, args.source_fps)
+        if info_H is None:
+            info_H, info_W = H, W
+
+        written_frames = write_episode(
             seq_dir,
             out_dir,
-            args.fps,
-            ep_idx,
+            episode_index,
             args.task,
-            args.no_video,
-            global_offset,
             states,
             actions,
+            args.target_fps,
+            source_fps,
+            target_len,
+            total_frames,
+            args.no_video,
         )
-        ep_idx += 1
-        global_offset += T
+        episodes_meta.append({"episode_index": episode_index, "tasks": [args.task], "length": written_frames})
+        total_frames += written_frames
         all_states.append(states)
         all_actions.append(actions)
 
-    total_episodes = max(existing_total_episodes, ep_idx)
-    total_frames = global_offset
-    write_info(out_dir, features, args.fps, total_episodes, total_frames)
+    with open(meta_dir / "episodes.jsonl", "w", encoding="utf-8") as f:
+        for episode in episodes_meta:
+            f.write(json.dumps(episode) + "\n")
 
     stats = {
         "observation.state": compute_stats(np.concatenate(all_states, axis=0)),
         "action": compute_stats(np.concatenate(all_actions, axis=0)),
+        **{video_key: image_stats() for video_key in CAMERAS},
     }
-    meta_dir.mkdir(parents=True, exist_ok=True)
     with open(meta_dir / "stats.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
+    info = build_info(info_H, info_W, len(episodes_meta), total_frames, args.target_fps)
+    with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+
     print(f"\nDataset written to: {out_dir}")
-    print(f"  newly_added_episodes={len(seq_dirs)}  total_episodes={total_episodes}  total_frames={total_frames}")
+    print(f"  episodes={len(episodes_meta)}  total_frames={total_frames}  fps={args.target_fps}")
 
 
 if __name__ == "__main__":

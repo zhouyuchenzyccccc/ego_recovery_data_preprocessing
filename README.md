@@ -190,3 +190,23 @@ python3 convert_to_lerobot.py --data_dir /path/to/ego2_2 --poses poses_2.npz --o
 ## 🤝 贡献
 
 [请根据实际情况添加贡献指南]
+
+## Download MediaPipe Model
+
+Download the `hand_landmarker.task` model to the default path used by `extract_wrist_pose.py`:
+
+```bash
+mkdir -p /home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe && \
+wget -O /home/ubuntu/WorkSpace/ZYC/hamer/_DATA/mediapipe/hand_landmarker.task \
+https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+```
+
+After downloading, you can run:
+
+```bash
+python3 extract_wrist_pose.py \
+    --data_dir /path/to/ego2_data \
+    --output wrist_poses.npz \
+    --cam_id 07 \
+    --smooth_method median_then_savgol
+```
