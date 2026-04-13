@@ -254,3 +254,15 @@ python3 visualize_wrist_pose.py \
     --ego_cam_id 07 \
     --fps 30.0
 ```
+
+## Visualize LeRobot 14D State On Video
+
+Overlay the 14-D LeRobot `observation.state` and `action` directly on the ego video:
+
+```bash
+python3 visualize_lerobot_state_video.py \
+    --dataset_dir /path/to/lerobot_dataset \
+    --source_seq_dir /path/to/raw_sequence_dir \
+    --episode_index 0 \
+    --ego_cam_id 07
+```
