@@ -12,3 +12,6 @@ lerobot_dataset/meta/tasks.jsonl
 lerobot_dataset/videos/chunk-000/observation.images.left_hand/episode_000000.mp4
 lerobot_dataset/videos/chunk-000/observation.images.right_hand/episode_000000.mp4
 .omc/project-memory.json
+.omc/state.json
+lerobot_dataset
+.omc
