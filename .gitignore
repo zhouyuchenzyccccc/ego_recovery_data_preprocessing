@@ -15,3 +15,5 @@ lerobot_dataset/videos/chunk-000/observation.images.right_hand/episode_000000.mp
 .omc/state.json
 lerobot_dataset
 .omc
+traj_pointcloud_test.mp4
+traj_pointcloud.mp4
